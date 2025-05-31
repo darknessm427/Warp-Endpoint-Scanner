@@ -1,0 +1,126 @@
+name: Generate and Test WARP IPs Daily
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at 00:00 UTC
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  generate_and_test_ips:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Allow GHA to push to the repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests PyNaCl
+
+      - name: Download and setup Xray-core
+        run: |
+          echo "Fetching latest Xray-core release information..."
+          # Use jq to more reliably parse the download URL
+          # This looks for Xray-linux-64.zip or Xray-linux-amd64.zip
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
+                         jq -r '.assets[] | select(.name | test("Xray-linux-(64|amd64)\\.zip$")) | .browser_download_url' | \
+                         head -n 1)
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            echo "Error: Could not find Xray-core download URL using jq. Attempting fallback with grep..."
+            # Fallback to grep if jq fails or is not available (though jq is standard on GH runners)
+            DOWNLOAD_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
+                           grep -oP '"browser_download_url":\s*"\K[^"]*Xray-linux-(64|amd64)\.zip"' | \
+                           head -n 1)
+            if [ -z "$DOWNLOAD_URL" ]; then
+                echo "Error: Fallback with grep also failed to find Xray-core download URL."
+                exit 1
+            fi
+          fi
+          
+          echo "Downloading Xray-core from: $DOWNLOAD_URL"
+          curl -L -o xray_core.zip "$DOWNLOAD_URL"
+          
+          echo "Extracting Xray-core..."
+          # Extract xray executable, geoip.dat, and geosite.dat to the current directory
+          # -o: Overwrite files without prompting
+          # -j: Junk paths (extract files to target directory, ignore internal directory structure in zip)
+          unzip -o -j xray_core.zip xray geoip.dat geosite.dat -d ./
+          
+          if [ ! -f ./xray ]; then
+            echo "Error: xray executable not found after extraction."
+            echo "Contents of current directory:"
+            ls -la ./ 
+            echo "Contents of xray_core.zip (if extraction failed silently):"
+            unzip -l xray_core.zip || echo "Could not list zip contents." # Attempt to list contents if unzip failed
+            exit 1
+          fi
+          
+          chmod +x ./xray # Grant execute permission
+          echo "Xray-core downloaded and setup successfully."
+          ls -la ./xray # Display details of the xray executable
+
+      - name: Test Basic IPv6 Connectivity (Optional Debug Step)
+        run: |
+          echo "--- Testing basic IPv6 connectivity ---"
+          ping -6 -c 3 google.com || echo "Warning: Ping to google.com over IPv6 failed or not available."
+          # Test connectivity to well-known IPv6 addresses
+          curl -6 -sS -o /dev/null --head http://[2606:4700:4700::1111]/cdn-cgi/trace && echo "Successfully connected to 1.1.1.1 (Cloudflare) over IPv6." || echo "Warning: Failed to connect to 1.1.1.1 (Cloudflare) over IPv6."
+          curl -6 -sS -o /dev/null --head http://[2001:4860:4860::8888]/cdn-cgi/trace && echo "Successfully connected to Google DNS over IPv6." || echo "Warning: Failed to connect to Google DNS over IPv6."
+          echo "--- End of basic IPv6 connectivity test ---"
+
+      - name: Run IP Generation and Test Script
+        # Assumes the Python script is named generate_and_test_ips.py
+        # and the Xray executable is in the current directory as ./xray
+        run: python WES.py 
+
+      - name: Display Xray Logs (for debugging)
+        if: always() # Run this step even if the previous step fails
+        run: |
+          XRAY_TEMP_DIR="xray_core_temp_files" # Directory where Python script saves Xray logs
+          echo "--- Xray STDOUT Log (${XRAY_TEMP_DIR}/xray_stdout.log) ---"
+          cat "${XRAY_TEMP_DIR}/xray_stdout.log" || echo "Xray stdout log not found or empty."
+          echo "--- Xray STDERR Log (${XRAY_TEMP_DIR}/xray_stderr.log) ---"
+          cat "${XRAY_TEMP_DIR}/xray_stderr.log" || echo "Xray stderr log not found or empty."
+          echo "--- Xray Access Log (${XRAY_TEMP_DIR}/access.log from Xray config) ---"
+          cat "${XRAY_TEMP_DIR}/access.log" || echo "Xray access log (from config) not found or empty."
+          echo "--- Xray Error Log (${XRAY_TEMP_DIR}/error.log from Xray config) ---"
+          cat "${XRAY_TEMP_DIR}/error.log" || echo "Xray error log (from config) not found or empty."
+
+      - name: Commit and Push Results
+        run: |
+          git config --global user.name 'GitHub Action Bot'
+          # Use a standard bot email address
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com' 
+          
+          # The output file generated by the Python script
+          OUTPUT_FILE="README.md" 
+
+          if [ ! -f $OUTPUT_FILE ]; then
+            echo "Output file $OUTPUT_FILE not found. Skipping commit."
+            # If the file is not generated, it might indicate no IPs were found or an error.
+            # Exiting with 0 so the workflow doesn't fail if this is an acceptable outcome.
+            # Change to 'exit 1' if not generating the file should always be an error.
+            exit 0 
+          fi
+
+          git add $OUTPUT_FILE
+          
+          # Check if there are any changes to commit
+          # --quiet suppresses output, --exit-code returns 0 if no changes, 1 if changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit for $OUTPUT_FILE."
+          else
+            echo "Committing changes for $OUTPUT_FILE..."
+            git commit -m "Daily update of tested WARP IPs (README.md)"
+            echo "Pushing changes to repository..."
+            git push
+          fi
